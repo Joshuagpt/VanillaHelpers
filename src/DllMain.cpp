@@ -23,6 +23,10 @@
 
 #include <string>
 
+// Set to 1 to skip Allocator::Initialize()/InstallHooks() for isolation testing of the
+// exit-time SGroupPtr/SMem3 crash. Set back to 0 once done.
+#define VH_TEST_DISABLE_ALLOCATOR 1
+
 static Game::InitializeGlobal_t InitializeGlobal_o = nullptr;
 static Game::FrameScript_Initialize_t FrameScript_Initialize_o = nullptr;
 static Game::LoadScriptFunctions_t LoadScriptFunctions_o = nullptr;
@@ -62,7 +66,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
 
+#if !VH_TEST_DISABLE_ALLOCATOR
         Allocator::Initialize();
+#endif
         Texture::Initialize();
 
         if (MH_Initialize() != MH_OK)
@@ -81,8 +87,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
                       LoadScriptFunctions_o);
         HOOK_FUNCTION(Offsets::FUN_CGGAMEUI_SHUTDOWN, CGGameUI_Shutdown_h, CGGameUI_Shutdown_o);
 
+#if !VH_TEST_DISABLE_ALLOCATOR
         if (!Allocator::InstallHooks())
             return FALSE;
+#endif
         if (!Texture::InstallHooks())
             return FALSE;
     } else if (reason == DLL_PROCESS_DETACH) {
