@@ -325,21 +325,13 @@ static void __stdcall TextureBlitBlend_h(void *unk0, void *unk1, Game::Point *ds
     TextureBlitBlend_o(unk0, unk1, dstOffset, srcOffset, copy, srcExtent);
 }
 
-// Set to 1 to skip InstallNewTexturePool() for isolation testing of the exit-time
-// SGroupPtr/SMem3 crash. Keep PatchTextureSizeLimit()/InstallNewAsyncFileBuffer() enabled,
-// since disabling those causes an immediate ACCESS_VIOLATION on load with large textures.
-// Set back to 0 once done.
-#define VH_TEST_DISABLE_TEXPOOL 1
-
 void Initialize() {
     PatchTextureSizeLimit();
 
     // Currently crashes with a buffer bigger than 2 MiB while loading textures bigger than 2 MiB
     InstallNewAsyncFileBuffer();
 
-#if !VH_TEST_DISABLE_TEXPOOL
     InstallNewTexturePool();
-#endif
 }
 
 bool InstallHooks() {
