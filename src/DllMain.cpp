@@ -52,10 +52,20 @@ static void __fastcall LoadScriptFunctions_h() {
     Morph::RegisterLuaFunctions();
 }
 
+// Set to 1 to skip Morph::Reset() / Blips::Reset() for isolation testing of the exit-time
+// SGroupPtr/SMem3 crash. CGGameUI_Shutdown_o() itself always still runs either way.
+// Set back to 0 once done.
+#define VH_TEST_DISABLE_MORPH_RESET 1
+#define VH_TEST_DISABLE_BLIPS_RESET 1
+
 static void __fastcall CGGameUI_Shutdown_h() {
+#if !VH_TEST_DISABLE_MORPH_RESET
     Morph::Reset();
+#endif
     CGGameUI_Shutdown_o();
+#if !VH_TEST_DISABLE_BLIPS_RESET
     Blips::Reset();
+#endif
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
