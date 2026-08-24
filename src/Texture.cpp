@@ -81,7 +81,8 @@ first:
 }
 
 static void InstallNewAsyncFileBuffer() {
-    const uint32_t newSize = 0x2000000; // 32 MiB
+    const uint32_t newSize = 0x4000000; // 64 MiB (was 32 MiB - testing whether sustained
+                                         // streaming during long flights overruns the buffer)
     g_asyncBuf = VirtualAlloc(nullptr, newSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!g_asyncBuf)
         return;
