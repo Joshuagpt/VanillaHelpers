@@ -17,7 +17,13 @@
 #include "MinHook.h"
 #include "Offsets.h"
 
+#include <chrono>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <stdint.h>
+#include <windows.h>
 
 namespace Allocator {
 
@@ -30,6 +36,64 @@ static void *SMemGetSizeInternal_Decode_o = nullptr;
 static constexpr uint8_t MAX_SMALL_CLASS = 0x19; // 32 MiB
 static constexpr uint32_t REGION_SIZE = 1U << MAX_SMALL_CLASS;
 static constexpr uint32_t REGION_SIZE_NEG = 0U - REGION_SIZE;
+
+// ── Crash diagnostics: large ("big small class") allocation log ──
+// The SGroupPtr / SMem3 "invalid block" crash this project has been
+// chasing is a Free-time failure, but SMemFreeInternal_Decode_h (and the
+// GetSize/Realloc decode counterparts below) are hand-written naked asm
+// trampolines with no safe insertion point for a C-level log call without
+// risking corrupting the very hot, register-constrained calling convention
+// they rely on — so we deliberately do NOT instrument them here. Doing so
+// blind, with no way to test-compile the result against the real binary
+// first, risks introducing a worse bug than the one being chased.
+//
+// What we CAN safely log, from the ordinary C-ABI Alloc/Realloc hooks
+// below, is every allocation that actually exercises the size-bit hack
+// (>= 16 MiB, the original engine's small-block ceiling before this DLL
+// raised it to 32 MiB via UpdateSmallSizeBit). If a crash's log shows zero
+// such allocations ever happened in that session, that's strong evidence
+// the size-bit encoding isn't the cause at all.
+//
+// Each line is written and flushed immediately, not buffered in memory,
+// since it isn't known whether the game's crash handler calls ExitProcess
+// (runs DllMain's DLL_PROCESS_DETACH) or TerminateProcess (skips it
+// entirely) when the user presses "OK to terminate" — an immediate
+// per-event write is the only way to guarantee the log reaches disk either
+// way. The >=16 MiB threshold keeps the volume of this near-zero in normal
+// play (a handful of events per session at most), so the per-write file
+// I/O cost is not a concern.
+static SRWLOCK g_crashLogLock = SRWLOCK_INIT;
+static constexpr uint32_t CRASH_LOG_SIZE_THRESHOLD = 0x1000000; // 16 MiB
+
+static void AppendCrashLog(const char *kind, const void *thisOrBlk, uint32_t sizeClass,
+                           uint32_t size, const void *result) {
+    if (size < CRASH_LOG_SIZE_THRESHOLD)
+        return;
+
+    AcquireSRWLockExclusive(&g_crashLogLock);
+
+    std::error_code ec;
+    std::filesystem::create_directories("VanillaHelpersData", ec);
+
+    std::ofstream out("VanillaHelpersData/CrashLog.txt", std::ios::app);
+    if (out) {
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        struct tm tmBuf {};
+        localtime_s(&tmBuf, &t);
+        char timeBuf[16];
+        strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &tmBuf);
+
+        out << "[" << timeBuf << "." << std::setfill('0') << std::setw(3) << ms.count() << "] "
+            << kind << " thread=" << GetCurrentThreadId() << " thisOrBlk=" << thisOrBlk
+            << " sizeClass=" << sizeClass << " size=0x" << std::hex << size << std::dec
+            << " result=" << result << "\n";
+    }
+
+    ReleaseSRWLockExclusive(&g_crashLogLock);
+}
 
 // Store bit24 of size into header1 bit5.
 // This preserves the extra size bit for 32 MiB small blocks.
@@ -48,6 +112,7 @@ static void *__fastcall SMemAllocInternal_h(void *thisptr, void * /*edx*/, uint3
     void *p = SMemAllocInternal_o(thisptr, sizeClass, size, commit);
     if (p && commit)
         UpdateSmallSizeBit(p, size, sizeClass);
+    AppendCrashLog("ALLOC", thisptr, sizeClass, size, p);
     return p;
 }
 
@@ -55,6 +120,7 @@ static void *__fastcall SMemReallocInternal_h(void *thisptr, void * /*edx*/, voi
                                               uint32_t sizeClass, uint32_t size) {
     void *p = SMemReallocInternal_o(thisptr, blk, sizeClass, size);
     UpdateSmallSizeBit(p, size, sizeClass);
+    AppendCrashLog("REALLOC", blk, sizeClass, size, p);
     return p;
 }
 
