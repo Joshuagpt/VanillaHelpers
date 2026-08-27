@@ -28,6 +28,13 @@ static void *SMemReallocInternal_Decode_o = nullptr;
 static void *SMemFreeInternal_Decode_o = nullptr;
 static void *SMemGetSizeInternal_Decode_o = nullptr;
 
+// Verified on user Turtle WoW.exe (image base 0x400000):
+//   0x6452A0  push ebp / mov ebp,esp ... mov esi,ecx; mov edi,edx; ... ret 4
+// Call site 0x646235: ecx=0x8510007C, edx=object, stack=extra
+// MSVC __fastcall: 1st=ecx, 2nd=edx, rest on stack; callee cleans stack args (ret 4).
+using SMem3RaiseError_t = void(__fastcall *)(int errorCode, void *object, int extra);
+static SMem3RaiseError_t SMem3RaiseError_o = nullptr;
+
 static constexpr uint8_t MAX_SMALL_CLASS = 0x19; // 32 MiB
 static constexpr uint32_t REGION_SIZE = 1U << MAX_SMALL_CLASS;
 static constexpr uint32_t REGION_SIZE_NEG = 0U - REGION_SIZE;
@@ -40,7 +47,6 @@ void SetShuttingDown(bool shuttingDown) {
 
 bool IsShuttingDown() { return InterlockedCompareExchange(&g_shuttingDown, 0, 0) != 0; }
 
-// Cheap probe: pointer looks like a plausible heap block header the client might free.
 static bool LooksPlausibleBlock(void *blk) {
     if (!blk)
         return false;
@@ -60,8 +66,6 @@ static bool LooksPlausibleBlock(void *blk) {
     }
 }
 
-// Store bit24 of size into header1 bit5.
-// This preserves the extra size bit for 32 MiB small blocks.
 static inline void UpdateSmallSizeBit(void *hdr, uint32_t size, uint32_t sizeClass) {
     if (!hdr || sizeClass > MAX_SMALL_CLASS)
         return;
@@ -82,7 +86,6 @@ static void *__fastcall SMemAllocInternal_h(void *thisptr, void * /*edx*/, uint3
 
 static void *__fastcall SMemReallocInternal_h(void *thisptr, void * /*edx*/, void *blk,
                                               uint32_t sizeClass, uint32_t size) {
-    // During shutdown, avoid feeding a dubious pointer into realloc (can RaiseError).
     if (IsShuttingDown() && blk && !LooksPlausibleBlock(blk)) {
         void *p = SMemAllocInternal_o(thisptr, sizeClass, size, 1);
         if (p)
@@ -96,8 +99,6 @@ static void *__fastcall SMemReallocInternal_h(void *thisptr, void * /*edx*/, voi
     return p;
 }
 
-// The allocator decodes size by size = (hdr0 >> 8) for small blocks.
-// We OR the saved bit24 (header1 bit5) back into the size.
 static __declspec(naked) void SMemReallocInternal_Decode_h() {
     __asm {
         test    byte ptr [edi + 4], 0x20
@@ -128,8 +129,18 @@ static __declspec(naked) void SMemGetSizeInternal_Decode_h() {
     }
 }
 
+// Swallow ERROR #124 only while CGGameUI_Shutdown is running.
+static void __fastcall SMem3RaiseError_h(int errorCode, void *object, int extra) {
+    if (IsShuttingDown()) {
+        // Exit-time invalid free (often SGroupPtr after complex WMO/portal routes).
+        // Do not show MessageBox or terminate; process is going away anyway.
+        return;
+    }
+    if (SMem3RaiseError_o)
+        SMem3RaiseError_o(errorCode, object, extra);
+}
+
 static void PatchBiggerMemoryRegion() {
-    // 32 MiB regions (128 regions -> 4 GiB virtual address space)
     Common::PatchBytes(reinterpret_cast<void *>(Offsets::PATCH_SMEM_RESERVE_PUSH_SIZE + 1),
                        &REGION_SIZE, sizeof(REGION_SIZE));
     Common::PatchBytes(reinterpret_cast<void *>(Offsets::PATCH_SMEM_RESERVE_ACCOUNT_INC + 3),
@@ -139,7 +150,6 @@ static void PatchBiggerMemoryRegion() {
     Common::PatchBytes(reinterpret_cast<void *>(Offsets::PATCH_SMEM_VALIDATE_REGION_END_LEA + 2),
                        &REGION_SIZE, sizeof(REGION_SIZE));
 
-    // Small vs large threshold = 0x19
     Common::PatchBytes(reinterpret_cast<void *>(Offsets::PATCH_SMEM_SMALL_LARGE_CMP_ALLOC_A + 2),
                        &MAX_SMALL_CLASS, sizeof(MAX_SMALL_CLASS));
     Common::PatchBytes(reinterpret_cast<void *>(Offsets::PATCH_SMEM_SMALL_LARGE_CMP_ALLOC_B + 2),
@@ -165,9 +175,6 @@ static void PatchBiggerMemoryRegion() {
 void Initialize() { PatchBiggerMemoryRegion(); }
 
 bool InstallHooks() {
-    // Only hook symbols that upstream VanillaHelpers already uses successfully on 1.12.
-    // Speculative free-wrapper / RaiseError hooks were removed: wrong offsets on Turtle
-    // clients caused ERROR #132 ACCESS_VIOLATION at startup (write to 0x00000001).
     HOOK_FUNCTION(Offsets::FUN_SMEM_ALLOC_INTERNAL, SMemAllocInternal_h, SMemAllocInternal_o);
     HOOK_FUNCTION(Offsets::FUN_SMEM_REALLOC_INTERNAL, SMemReallocInternal_h, SMemReallocInternal_o);
     HOOK_FUNCTION(Offsets::FUN_SMEM_REALLOC_INTERNAL_DECODE, SMemReallocInternal_Decode_h,
@@ -176,6 +183,9 @@ bool InstallHooks() {
                   SMemFreeInternal_Decode_o);
     HOOK_FUNCTION(Offsets::FUN_SMEM_GET_SIZE_INTERNAL_DECODE, SMemGetSizeInternal_Decode_h,
                   SMemGetSizeInternal_Decode_o);
+
+    // Critical for exit-only ERROR #124. Address verified against uploaded Turtle WoW.exe.
+    HOOK_FUNCTION(Offsets::FUN_SMEM3_RAISE_ERROR, SMem3RaiseError_h, SMem3RaiseError_o);
 
     return true;
 }
