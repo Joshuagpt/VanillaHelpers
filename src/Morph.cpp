@@ -42,6 +42,11 @@ static constexpr uint32_t VISIBLE_ITEM_STRIDE = 0xC;
 static void ApplyField(Game::CGPlayer_C *unit, uint32_t fieldIndex);
 
 static inline uint32_t *GetFieldSlot(Game::CGPlayer_C *unit, uint32_t fieldIndex) {
+    // During instance exit / zone transitions objects may still be enumerated while
+    // m_data has already been cleared. Never dereference a null data block.
+    if (!unit || !unit->m_data)
+        return nullptr;
+
     switch (fieldIndex) {
     case Game::UNIT_FIELD_DISPLAYID:
         return &unit->m_data->m_unitData.m_displayId;
@@ -113,6 +118,9 @@ static inline bool GetRemapValue(uint32_t fieldIndex, uint32_t base, morphValue_
 }
 
 static inline bool UsingNativeDisplay(Game::CGPlayer_C *unit) {
+    if (!unit || !unit->m_data)
+        return false;
+
     const uint64_t guid = unit->m_data->m_unitData.m_objectData.m_guid;
 
     morphValue_t value;
@@ -134,8 +142,12 @@ static inline bool UsingNativeDisplay(Game::CGPlayer_C *unit) {
 
 static inline bool EvaluateMorphValue(Game::CGPlayer_C *unit, uint32_t fieldIndex,
                                       const morphValue_t &morphValue, uint32_t &outValue) {
-    if (fieldIndex == Game::UNIT_FIELD_DISPLAYID && std::get<uint32_t>(morphValue) == 0) {
-        outValue = unit->m_data ? unit->m_data->m_unitData.m_nativeDisplayId : 0;
+    if (!unit || !unit->m_data)
+        return false;
+
+    if (fieldIndex == Game::UNIT_FIELD_DISPLAYID && std::holds_alternative<uint32_t>(morphValue) &&
+        std::get<uint32_t>(morphValue) == 0) {
+        outValue = unit->m_data->m_unitData.m_nativeDisplayId;
         return true;
     } else if (std::holds_alternative<std::shared_ptr<factionValuesMap_t>>(morphValue)) {
         auto factionReplacementMap = std::get<std::shared_ptr<factionValuesMap_t>>(morphValue);
@@ -156,14 +168,18 @@ static inline bool EvaluateMorphValue(Game::CGPlayer_C *unit, uint32_t fieldInde
             return true;
         }
         return false;
-    } else {
+    } else if (std::holds_alternative<uint32_t>(morphValue)) {
         outValue = std::get<uint32_t>(morphValue);
         return true;
     }
+    return false;
 }
 
 static inline bool EvaluateWriteReplacement(Game::CGPlayer_C *unit, uint32_t fieldIndex,
                                             uint32_t incoming, uint32_t &outValue) {
+    if (!unit || !unit->m_data)
+        return false;
+
     const uint64_t guid = unit->m_data->m_unitData.m_objectData.m_guid;
     morphValue_t value;
     if (GetOverrideValue(guid, fieldIndex, value)) {
@@ -185,6 +201,9 @@ static inline bool EvaluateWriteReplacement(Game::CGPlayer_C *unit, uint32_t fie
 }
 
 static void OnDisplayIDChanged(Game::CGPlayer_C *unit, uint32_t newValue) {
+    if (!unit || !unit->m_data)
+        return;
+
     const auto itOriginal = g_original.find(unit->m_data->m_unitData.m_objectData.m_guid);
     if (itOriginal != g_original.end()) {
         const auto itOriginalFields = itOriginal->second.find(Game::UNIT_FIELD_DISPLAYID);
@@ -311,9 +330,14 @@ static inline void OnFieldChanging(Game::CGPlayer_C *unit, uint32_t fieldIndex, 
 }
 
 static void ReloadUnitDisplay(Game::CGPlayer_C *unit) {
+    if (!unit || !unit->m_data)
+        return;
     uint32_t original = unit->m_data->m_unitData.m_displayId;
     unit->m_data->m_unitData.m_displayId = 15435;
     Game::CGUnit_C_UpdateDisplayInfo(reinterpret_cast<Game::CGUnit_C *>(unit));
+    // Object may have been torn down mid-update during zone transition.
+    if (!unit->m_data)
+        return;
     unit->m_data->m_unitData.m_displayId = original;
     Game::CGUnit_C_UpdateDisplayInfo(reinterpret_cast<Game::CGUnit_C *>(unit));
 }
@@ -354,7 +378,7 @@ static inline void OnFieldChanged(Game::CGPlayer_C *unit, uint32_t fieldIndex) {
 
 static void ApplyField(Game::CGPlayer_C *unit, uint32_t fieldIndex) {
     uint32_t *slot = GetFieldSlot(unit, fieldIndex);
-    if (!slot)
+    if (!slot || !unit || !unit->m_data)
         return;
 
     const uint64_t guid = unit->m_data->m_unitData.m_objectData.m_guid;
@@ -404,14 +428,20 @@ static void ApplyField(Game::CGPlayer_C *unit, uint32_t fieldIndex) {
 
 static int __fastcall CGObject_C_SetBlock_h(Game::CGObject_C *thisptr, void * /*edx*/,
                                             uint32_t fieldIndex, uint32_t value) {
-    if (thisptr->m_objectType != Game::OBJECT_TYPE::PLAYER) {
+    if (!thisptr || thisptr->m_objectType != Game::OBJECT_TYPE::PLAYER) {
         return CGObject_C_SetBlock_o(thisptr, fieldIndex, value);
     }
 
     auto *unit = reinterpret_cast<Game::CGPlayer_C *>(thisptr);
 
+    // Zone transitions can call SetBlock after m_data has been cleared.
+    if (!unit->m_data) {
+        return CGObject_C_SetBlock_o(thisptr, fieldIndex, value);
+    }
+
     if (fieldIndex == Game::UNIT_FIELD_NATIVEDISPLAYID && UsingNativeDisplay(unit)) {
-        unit->m_data->m_unitData.m_displayId = value;
+        if (unit->m_data)
+            unit->m_data->m_unitData.m_displayId = value;
     }
 
     if (GetFieldSlot(unit, fieldIndex) != nullptr) {
@@ -426,7 +456,11 @@ static int __fastcall CGObject_C_SetBlock_h(Game::CGObject_C *thisptr, void * /*
 }
 
 static void __fastcall CGUnit_C_Destructor_h(Game::CGUnit_C *thisptr) {
-    g_original.erase(thisptr->m_guid);
+    if (thisptr) {
+        g_original.erase(thisptr->m_guid);
+        // Also drop per-guid overrides so we never re-apply against a freed object.
+        g_overrides.erase(thisptr->m_guid);
+    }
     CGUnit_C_Destructor_o(thisptr);
 }
 
@@ -455,7 +489,8 @@ static bool UninstallHooks() {
 static bool __fastcall RefreshFieldCallback(void *context, void * /*edx*/, uint64_t guid) {
     auto *unit = reinterpret_cast<Game::CGPlayer_C *>(
         Game::ClntObjMgrObjectPtr(Game::TYPE_MASK::TYPEMASK_PLAYER, nullptr, guid, 0));
-    if (!unit)
+    // Object may exist in the manager but already have m_data cleared during zone change.
+    if (!unit || !unit->m_data)
         return true;
 
     if (context == nullptr) {
@@ -826,8 +861,15 @@ void RegisterLuaFunctions() {
 void Reset() {
     g_overrides.clear();
     g_remap.clear();
-    if (Game::ClntObjMgrGetActivePlayer() > 0) {
-        Game::ClntObjMgrEnumVisibleObjects(RefreshFieldCallback, nullptr);
+    // During CGGameUI_Shutdown the object manager is already inconsistent; skip re-apply.
+    // Only restore fields if we still have a living active player.
+    const uint64_t active = Game::ClntObjMgrGetActivePlayer();
+    if (active > 0) {
+        auto *player = Game::ClntObjMgrObjectPtr(Game::TYPE_MASK::TYPEMASK_PLAYER, nullptr, active,
+                                                 0);
+        if (player && player->m_data) {
+            Game::ClntObjMgrEnumVisibleObjects(RefreshFieldCallback, nullptr);
+        }
     }
     g_original.clear();
     UninstallHooks();

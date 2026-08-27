@@ -130,7 +130,7 @@ static bool CheckObject(Game::MINIMAPINFO *info, uint64_t guid) {
         return false;
 
     Game::CGObject_C *objptr = Game::ClntObjMgrObjectPtr(typemask, nullptr, guid, 0);
-    if (objptr == nullptr)
+    if (objptr == nullptr || objptr->m_data == nullptr)
         return false;
 
     if (objptr->m_objectType == Game::OBJECT_TYPE::UNIT) {

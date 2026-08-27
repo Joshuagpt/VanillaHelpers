@@ -287,8 +287,12 @@ static uint8_t GetCharacterSkinSizeSetting() {
 
 // It will return true (it shouldn't) when textures are too big for the character skin, this isn't
 // desirable, but this was the best I could do with my knowledge of those functions.
+// During zone transitions (instance exit) the client may call blit paths with partially
+// torn-down character component state; treat any null geometry as "does not fit".
 static inline bool TextureBlitFits(const Game::Point *offset, const Game::Rectangle *copy,
                                    const Game::Rectangle *extent) {
+    if (!offset || !copy || !extent)
+        return false;
     if (offset->x >= extent->width || offset->y >= extent->heigth)
         return false;
     const uint32_t remainW = extent->width - offset->x;
@@ -299,6 +303,8 @@ static inline bool TextureBlitFits(const Game::Point *offset, const Game::Rectan
 static void __stdcall TextureBlitCopy_h(void *unk0, void *unk1, Game::Point *srcOffset,
                                         Game::Point *dstOffset, Game::Rectangle *copy,
                                         Game::Rectangle *dstExtent) {
+    if (!srcOffset || !dstOffset || !copy || !dstExtent)
+        return;
     if (!TextureBlitFits(dstOffset, copy, dstExtent)) {
         return;
     }
@@ -308,6 +314,8 @@ static void __stdcall TextureBlitCopy_h(void *unk0, void *unk1, Game::Point *src
 static void __stdcall TextureBlitMasked_h(void *unk0, void *unk1, Game::Point *dstOffset,
                                           Game::Point *srcOffset, Game::Rectangle *copy,
                                           Game::Rectangle *srcExtent) {
+    if (!dstOffset || !srcOffset || !copy || !srcExtent)
+        return;
     if (!TextureBlitFits(srcOffset, copy, srcExtent)) {
         return;
     }
@@ -318,6 +326,8 @@ static void __stdcall TextureBlitMasked_h(void *unk0, void *unk1, Game::Point *d
 static void __stdcall TextureBlitBlend_h(void *unk0, void *unk1, Game::Point *dstOffset,
                                          Game::Point *srcOffset, Game::Rectangle *copy,
                                          Game::Rectangle *srcExtent) {
+    if (!dstOffset || !srcOffset || !copy || !srcExtent)
+        return;
     if (!TextureBlitFits(srcOffset, copy, srcExtent)) {
         return;
     }
