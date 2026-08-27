@@ -28,23 +28,11 @@ static void *SMemReallocInternal_Decode_o = nullptr;
 static void *SMemFreeInternal_Decode_o = nullptr;
 static void *SMemGetSizeInternal_Decode_o = nullptr;
 
-// High-level free entry used by many game paths (including WMO/SGroup teardown).
-// Signature mirrors common 1.12 SMem free wrapper: void __thiscall(void *allocator, void *blk)
-using SMemFreeWrapper_t = void(__thiscall *)(void *thisptr, void *blk);
-static SMemFreeWrapper_t SMemFreeWrapper_o = nullptr;
-
-// SMem3RaiseError — when free detects an invalid block it ends up here and shows
-// ERROR #124 MessageBox. We no-op this during shutdown so exit does not terminate hard.
-using SMem3RaiseError_t = void(__cdecl *)(int errorCode, void *object, int extra);
-static SMem3RaiseError_t SMem3RaiseError_o = nullptr;
-
 static constexpr uint8_t MAX_SMALL_CLASS = 0x19; // 32 MiB
 static constexpr uint32_t REGION_SIZE = 1U << MAX_SMALL_CLASS;
 static constexpr uint32_t REGION_SIZE_NEG = 0U - REGION_SIZE;
 
 static volatile LONG g_shuttingDown = 0;
-static volatile LONG g_swallowedFrees = 0;
-static volatile LONG g_swallowedRaiseErrors = 0;
 
 void SetShuttingDown(bool shuttingDown) {
     InterlockedExchange(&g_shuttingDown, shuttingDown ? 1 : 0);
@@ -58,7 +46,6 @@ static bool LooksPlausibleBlock(void *blk) {
         return false;
 
     const uintptr_t p = reinterpret_cast<uintptr_t>(blk);
-    // User-mode, reasonably aligned (SMem headers are typically 8-byte aligned).
     if (p < 0x10000u || (p & 7u) != 0)
         return false;
 
@@ -71,11 +58,6 @@ static bool LooksPlausibleBlock(void *blk) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-}
-
-static void LogSwallow(const char *what, void *blk) {
-    (void)what;
-    (void)blk;
 }
 
 // Store bit24 of size into header1 bit5.
@@ -100,10 +82,8 @@ static void *__fastcall SMemAllocInternal_h(void *thisptr, void * /*edx*/, uint3
 
 static void *__fastcall SMemReallocInternal_h(void *thisptr, void * /*edx*/, void *blk,
                                               uint32_t sizeClass, uint32_t size) {
-    // During shutdown, never feed a dubious pointer into realloc (it can RaiseError).
+    // During shutdown, avoid feeding a dubious pointer into realloc (can RaiseError).
     if (IsShuttingDown() && blk && !LooksPlausibleBlock(blk)) {
-        InterlockedIncrement(&g_swallowedFrees);
-        LogSwallow("realloc-bad-blk", blk);
         void *p = SMemAllocInternal_o(thisptr, sizeClass, size, 1);
         if (p)
             UpdateSmallSizeBit(p, size, sizeClass);
@@ -148,43 +128,6 @@ static __declspec(naked) void SMemGetSizeInternal_Decode_h() {
     }
 }
 
-// Free wrapper: many teardown paths (including SGroup / WMO) go through here.
-// On shutdown, skip frees of pointers that no longer look like live SMem blocks.
-static void __fastcall SMemFreeWrapper_h(void *thisptr, void * /*edx*/, void *blk) {
-    if (!blk) {
-        if (SMemFreeWrapper_o)
-            SMemFreeWrapper_o(thisptr, blk);
-        return;
-    }
-
-    if (IsShuttingDown() && !LooksPlausibleBlock(blk)) {
-        InterlockedIncrement(&g_swallowedFrees);
-        LogSwallow("free-wrapper-bad-blk", blk);
-        return;
-    }
-
-    if (!SMemFreeWrapper_o)
-        return;
-
-    __try {
-        SMemFreeWrapper_o(thisptr, blk);
-    } __except (IsShuttingDown() ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-        InterlockedIncrement(&g_swallowedFrees);
-        LogSwallow("free-wrapper-exception", blk);
-    }
-}
-
-// ERROR #124 path. During play: original behaviour. During shutdown: silent return.
-static void __cdecl SMem3RaiseError_h(int errorCode, void *object, int extra) {
-    if (IsShuttingDown()) {
-        InterlockedIncrement(&g_swallowedRaiseErrors);
-        LogSwallow("raise-error", object);
-        return;
-    }
-    if (SMem3RaiseError_o)
-        SMem3RaiseError_o(errorCode, object, extra);
-}
-
 static void PatchBiggerMemoryRegion() {
     // 32 MiB regions (128 regions -> 4 GiB virtual address space)
     Common::PatchBytes(reinterpret_cast<void *>(Offsets::PATCH_SMEM_RESERVE_PUSH_SIZE + 1),
@@ -222,6 +165,9 @@ static void PatchBiggerMemoryRegion() {
 void Initialize() { PatchBiggerMemoryRegion(); }
 
 bool InstallHooks() {
+    // Only hook symbols that upstream VanillaHelpers already uses successfully on 1.12.
+    // Speculative free-wrapper / RaiseError hooks were removed: wrong offsets on Turtle
+    // clients caused ERROR #132 ACCESS_VIOLATION at startup (write to 0x00000001).
     HOOK_FUNCTION(Offsets::FUN_SMEM_ALLOC_INTERNAL, SMemAllocInternal_h, SMemAllocInternal_o);
     HOOK_FUNCTION(Offsets::FUN_SMEM_REALLOC_INTERNAL, SMemReallocInternal_h, SMemReallocInternal_o);
     HOOK_FUNCTION(Offsets::FUN_SMEM_REALLOC_INTERNAL_DECODE, SMemReallocInternal_Decode_h,
@@ -230,24 +176,6 @@ bool InstallHooks() {
                   SMemFreeInternal_Decode_o);
     HOOK_FUNCTION(Offsets::FUN_SMEM_GET_SIZE_INTERNAL_DECODE, SMemGetSizeInternal_Decode_h,
                   SMemGetSizeInternal_Decode_o);
-
-    // Optional but important for exit-time SGroup frees.
-    // If the offset is wrong on a modified client, hook creation fails — treat as non-fatal.
-    {
-        auto *target = reinterpret_cast<LPVOID>(Offsets::FUN_SMEM_FREE_WRAPPER);
-        if (MH_CreateHook(target, reinterpret_cast<LPVOID>(SMemFreeWrapper_h),
-                          reinterpret_cast<LPVOID *>(&SMemFreeWrapper_o)) == MH_OK) {
-            MH_EnableHook(target);
-        }
-    }
-
-    {
-        auto *target = reinterpret_cast<LPVOID>(Offsets::FUN_SMEM3_RAISE_ERROR);
-        if (MH_CreateHook(target, reinterpret_cast<LPVOID>(SMem3RaiseError_h),
-                          reinterpret_cast<LPVOID *>(&SMem3RaiseError_o)) == MH_OK) {
-            MH_EnableHook(target);
-        }
-    }
 
     return true;
 }
