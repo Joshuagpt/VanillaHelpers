@@ -17,11 +17,6 @@
 #include "MinHook.h"
 #include "Offsets.h"
 
-#include <chrono>
-#include <ctime>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
 #include <stdint.h>
 #include <windows.h>
 
@@ -33,66 +28,54 @@ static void *SMemReallocInternal_Decode_o = nullptr;
 static void *SMemFreeInternal_Decode_o = nullptr;
 static void *SMemGetSizeInternal_Decode_o = nullptr;
 
+// High-level free entry used by many game paths (including WMO/SGroup teardown).
+// Signature mirrors common 1.12 SMem free wrapper: void __thiscall(void *allocator, void *blk)
+using SMemFreeWrapper_t = void(__thiscall *)(void *thisptr, void *blk);
+static SMemFreeWrapper_t SMemFreeWrapper_o = nullptr;
+
+// SMem3RaiseError — when free detects an invalid block it ends up here and shows
+// ERROR #124 MessageBox. We no-op this during shutdown so exit does not terminate hard.
+using SMem3RaiseError_t = void(__cdecl *)(int errorCode, void *object, int extra);
+static SMem3RaiseError_t SMem3RaiseError_o = nullptr;
+
 static constexpr uint8_t MAX_SMALL_CLASS = 0x19; // 32 MiB
 static constexpr uint32_t REGION_SIZE = 1U << MAX_SMALL_CLASS;
 static constexpr uint32_t REGION_SIZE_NEG = 0U - REGION_SIZE;
 
-// ── Crash diagnostics: large ("big small class") allocation log ──
-// The SGroupPtr / SMem3 "invalid block" crash this project has been
-// chasing is a Free-time failure, but SMemFreeInternal_Decode_h (and the
-// GetSize/Realloc decode counterparts below) are hand-written naked asm
-// trampolines with no safe insertion point for a C-level log call without
-// risking corrupting the very hot, register-constrained calling convention
-// they rely on — so we deliberately do NOT instrument them here. Doing so
-// blind, with no way to test-compile the result against the real binary
-// first, risks introducing a worse bug than the one being chased.
-//
-// What we CAN safely log, from the ordinary C-ABI Alloc/Realloc hooks
-// below, is every allocation that actually exercises the size-bit hack
-// (>= 16 MiB, the original engine's small-block ceiling before this DLL
-// raised it to 32 MiB via UpdateSmallSizeBit). If a crash's log shows zero
-// such allocations ever happened in that session, that's strong evidence
-// the size-bit encoding isn't the cause at all.
-//
-// Each line is written and flushed immediately, not buffered in memory,
-// since it isn't known whether the game's crash handler calls ExitProcess
-// (runs DllMain's DLL_PROCESS_DETACH) or TerminateProcess (skips it
-// entirely) when the user presses "OK to terminate" — an immediate
-// per-event write is the only way to guarantee the log reaches disk either
-// way. The >=16 MiB threshold keeps the volume of this near-zero in normal
-// play (a handful of events per session at most), so the per-write file
-// I/O cost is not a concern.
-static SRWLOCK g_crashLogLock = SRWLOCK_INIT;
-static constexpr uint32_t CRASH_LOG_SIZE_THRESHOLD = 0x1000000; // 16 MiB
+static volatile LONG g_shuttingDown = 0;
+static volatile LONG g_swallowedFrees = 0;
+static volatile LONG g_swallowedRaiseErrors = 0;
 
-static void AppendCrashLog(const char *kind, const void *thisOrBlk, uint32_t sizeClass,
-                           uint32_t size, const void *result) {
-    if (size < CRASH_LOG_SIZE_THRESHOLD)
-        return;
+void SetShuttingDown(bool shuttingDown) {
+    InterlockedExchange(&g_shuttingDown, shuttingDown ? 1 : 0);
+}
 
-    AcquireSRWLockExclusive(&g_crashLogLock);
+bool IsShuttingDown() { return InterlockedCompareExchange(&g_shuttingDown, 0, 0) != 0; }
 
-    std::error_code ec;
-    std::filesystem::create_directories("VanillaHelpersData", ec);
+// Cheap probe: pointer looks like a plausible heap block header the client might free.
+static bool LooksPlausibleBlock(void *blk) {
+    if (!blk)
+        return false;
 
-    std::ofstream out("VanillaHelpersData/CrashLog.txt", std::ios::app);
-    if (out) {
-        auto now = std::chrono::system_clock::now();
-        auto t = std::chrono::system_clock::to_time_t(now);
-        auto ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-        struct tm tmBuf {};
-        localtime_s(&tmBuf, &t);
-        char timeBuf[16];
-        strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &tmBuf);
+    const uintptr_t p = reinterpret_cast<uintptr_t>(blk);
+    // User-mode, reasonably aligned (SMem headers are typically 8-byte aligned).
+    if (p < 0x10000u || (p & 7u) != 0)
+        return false;
 
-        out << "[" << timeBuf << "." << std::setfill('0') << std::setw(3) << ms.count() << "] "
-            << kind << " thread=" << GetCurrentThreadId() << " thisOrBlk=" << thisOrBlk
-            << " sizeClass=" << sizeClass << " size=0x" << std::hex << size << std::dec
-            << " result=" << result << "\n";
+    __try {
+        volatile uint32_t w0 = *reinterpret_cast<volatile uint32_t *>(blk);
+        volatile uint32_t w1 = *(reinterpret_cast<volatile uint32_t *>(blk) + 1);
+        (void)w0;
+        (void)w1;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
+}
 
-    ReleaseSRWLockExclusive(&g_crashLogLock);
+static void LogSwallow(const char *what, void *blk) {
+    (void)what;
+    (void)blk;
 }
 
 // Store bit24 of size into header1 bit5.
@@ -112,15 +95,24 @@ static void *__fastcall SMemAllocInternal_h(void *thisptr, void * /*edx*/, uint3
     void *p = SMemAllocInternal_o(thisptr, sizeClass, size, commit);
     if (p && commit)
         UpdateSmallSizeBit(p, size, sizeClass);
-    AppendCrashLog("ALLOC", thisptr, sizeClass, size, p);
     return p;
 }
 
 static void *__fastcall SMemReallocInternal_h(void *thisptr, void * /*edx*/, void *blk,
                                               uint32_t sizeClass, uint32_t size) {
+    // During shutdown, never feed a dubious pointer into realloc (it can RaiseError).
+    if (IsShuttingDown() && blk && !LooksPlausibleBlock(blk)) {
+        InterlockedIncrement(&g_swallowedFrees);
+        LogSwallow("realloc-bad-blk", blk);
+        void *p = SMemAllocInternal_o(thisptr, sizeClass, size, 1);
+        if (p)
+            UpdateSmallSizeBit(p, size, sizeClass);
+        return p;
+    }
+
     void *p = SMemReallocInternal_o(thisptr, blk, sizeClass, size);
-    UpdateSmallSizeBit(p, size, sizeClass);
-    AppendCrashLog("REALLOC", blk, sizeClass, size, p);
+    if (p)
+        UpdateSmallSizeBit(p, size, sizeClass);
     return p;
 }
 
@@ -154,6 +146,43 @@ static __declspec(naked) void SMemGetSizeInternal_Decode_h() {
     skip:
         jmp     dword ptr [SMemGetSizeInternal_Decode_o]
     }
+}
+
+// Free wrapper: many teardown paths (including SGroup / WMO) go through here.
+// On shutdown, skip frees of pointers that no longer look like live SMem blocks.
+static void __fastcall SMemFreeWrapper_h(void *thisptr, void * /*edx*/, void *blk) {
+    if (!blk) {
+        if (SMemFreeWrapper_o)
+            SMemFreeWrapper_o(thisptr, blk);
+        return;
+    }
+
+    if (IsShuttingDown() && !LooksPlausibleBlock(blk)) {
+        InterlockedIncrement(&g_swallowedFrees);
+        LogSwallow("free-wrapper-bad-blk", blk);
+        return;
+    }
+
+    if (!SMemFreeWrapper_o)
+        return;
+
+    __try {
+        SMemFreeWrapper_o(thisptr, blk);
+    } __except (IsShuttingDown() ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        InterlockedIncrement(&g_swallowedFrees);
+        LogSwallow("free-wrapper-exception", blk);
+    }
+}
+
+// ERROR #124 path. During play: original behaviour. During shutdown: silent return.
+static void __cdecl SMem3RaiseError_h(int errorCode, void *object, int extra) {
+    if (IsShuttingDown()) {
+        InterlockedIncrement(&g_swallowedRaiseErrors);
+        LogSwallow("raise-error", object);
+        return;
+    }
+    if (SMem3RaiseError_o)
+        SMem3RaiseError_o(errorCode, object, extra);
 }
 
 static void PatchBiggerMemoryRegion() {
@@ -201,6 +230,24 @@ bool InstallHooks() {
                   SMemFreeInternal_Decode_o);
     HOOK_FUNCTION(Offsets::FUN_SMEM_GET_SIZE_INTERNAL_DECODE, SMemGetSizeInternal_Decode_h,
                   SMemGetSizeInternal_Decode_o);
+
+    // Optional but important for exit-time SGroup frees.
+    // If the offset is wrong on a modified client, hook creation fails — treat as non-fatal.
+    {
+        auto *target = reinterpret_cast<LPVOID>(Offsets::FUN_SMEM_FREE_WRAPPER);
+        if (MH_CreateHook(target, reinterpret_cast<LPVOID>(SMemFreeWrapper_h),
+                          reinterpret_cast<LPVOID *>(&SMemFreeWrapper_o)) == MH_OK) {
+            MH_EnableHook(target);
+        }
+    }
+
+    {
+        auto *target = reinterpret_cast<LPVOID>(Offsets::FUN_SMEM3_RAISE_ERROR);
+        if (MH_CreateHook(target, reinterpret_cast<LPVOID>(SMem3RaiseError_h),
+                          reinterpret_cast<LPVOID *>(&SMem3RaiseError_o)) == MH_OK) {
+            MH_EnableHook(target);
+        }
+    }
 
     return true;
 }

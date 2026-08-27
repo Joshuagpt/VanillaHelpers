@@ -11,16 +11,9 @@
 // You should have received a copy of the GNU Lessed General Public License along with
 // VanillaHelpers. If not, see <https://www.gnu.org/licenses/>.
 
-#pragma once
-
 namespace Allocator {
 
 void Initialize();
 bool InstallHooks();
-
-// Mark process as shutting down (CGGameUI_Shutdown). After this, free/realloc of
-// dubious blocks is soft-failed instead of raising ERROR #124.
-void SetShuttingDown(bool shuttingDown);
-bool IsShuttingDown();
 
 } // namespace Allocator

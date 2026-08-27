@@ -124,13 +124,10 @@ enum Offsets {
     FUN_SMEM_REALLOC_INTERNAL_DECODE = 0x645C31,
     FUN_SMEM_FREE_INTERNAL_DECODE = 0x645EC7,
     FUN_SMEM_GET_SIZE_INTERNAL_DECODE = 0x645846,
-    // Confirmed via disassembly (not a guess): __fastcall(int errorCode /*ecx*/,
-    // void *object /*edx*/, DWORD extra /*[ebp+8]*/). Looks up the error string for
-    // errorCode (valid range 0..0x7e, confirmed against the ERROR #124 crash text) and
-    // hands off to the shared fatal-error display routine. This is the closest verified
-    // point to the actual "pointer is invalid" detection code — its own callers are the
-    // real target for further investigation.
-    FUN_SMEM3_RAISE_ERROR = 0x6452A0,
+    // Exit soft-fail support (1.12.1 build 5875 style). Verify on your exe if hooks fail silently.
+    FUN_SMEM_FREE_WRAPPER = 0x646430,
+    // SMem3RaiseError — adjust if your client binary differs (search for ERROR #124 string refs).
+    FUN_SMEM3_RAISE_ERROR = 0x6461A0,
 
     LUA_PUSH_NIL = 0x6F37F0,
     LUA_IS_NUMBER = 0x6F34D0,
